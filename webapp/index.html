@@ -1,0 +1,222 @@
+<!doctype html>
+<!--
+  ESP-DJ3000 phone web app (design doc §4).
+
+  Single file, served from the master deck's LittleFS at http://dj.local/
+  (or via the captive portal on SoftAP "ESP-DJ"). One WebSocket at /ws;
+  continuous controls are throttled to 30 Hz client-side. Ops addressed
+  to the partner deck are relayed by the serving deck over DATA/ESP-NOW.
+
+  Flash into the littlefs partition, e.g.:
+    littlefs-python create webapp lfs.bin -v --fs-size=0x100000
+    esptool.py write_flash <littlefs offset> lfs.bin
+-->
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, user-scalable=no">
+<title>ESP-DJ</title>
+<style>
+  :root {
+    --bg: #0b0e13; --panel: #141a22; --edge: #232d3a;
+    --txt: #cfd8e3; --dim: #6b7789;
+    --cyan: #2dd6e8; --amber: #f5a623; --green: #3ddc84; --red: #ff5252;
+  }
+  * { box-sizing: border-box; margin: 0; -webkit-tap-highlight-color: transparent; }
+  html, body { height: 100%; }
+  body {
+    background: var(--bg); color: var(--txt);
+    font: 14px/1.3 -apple-system, "Segoe UI", Roboto, sans-serif;
+    user-select: none; touch-action: manipulation;
+    display: flex; flex-direction: column; padding: 8px; gap: 8px;
+  }
+  header { display: flex; justify-content: space-between; align-items: center; }
+  header h1 { font-size: 16px; letter-spacing: 2px; color: var(--dim); }
+  #conn { font-size: 11px; color: var(--red); }
+  #conn.ok { color: var(--green); }
+
+  .decks { display: flex; gap: 8px; flex: 1; min-height: 0; }
+  .deck {
+    flex: 1; background: var(--panel); border: 1px solid var(--edge);
+    border-radius: 12px; padding: 8px; display: flex; flex-direction: column;
+    gap: 8px; min-width: 0;
+  }
+  .deck[data-side="1"] { border-top: 3px solid var(--cyan); }
+  .deck[data-side="2"] { border-top: 3px solid var(--amber); }
+  .title { font-size: 12px; color: var(--dim); white-space: nowrap;
+           overflow: hidden; text-overflow: ellipsis; }
+  .bpm { font-size: 22px; font-weight: 700; }
+  .bpm small { font-size: 11px; color: var(--dim); font-weight: 400; }
+  .beatbar { height: 4px; border-radius: 2px; background: var(--edge); overflow: hidden; }
+  .beatbar i { display: block; height: 100%; width: 0; background: currentColor; }
+
+  .row { display: flex; gap: 6px; }
+  button {
+    flex: 1; padding: 10px 0; border-radius: 8px; border: 1px solid var(--edge);
+    background: #1b2430; color: var(--txt); font-size: 13px; font-weight: 600;
+  }
+  button:active { background: #2a3a4e; }
+  button.lit { background: #1d4d33; border-color: var(--green); color: var(--green); }
+  .pads { display: grid; grid-template-columns: repeat(4, 1fr); gap: 6px; }
+  .pads button { padding: 14px 0; }
+
+  .fader { display: flex; flex-direction: column; align-items: stretch; gap: 2px; }
+  .fader label { font-size: 10px; color: var(--dim); text-align: center; }
+  input[type=range] { width: 100%; accent-color: var(--cyan); height: 28px; }
+  .deck[data-side="2"] input[type=range] { accent-color: var(--amber); }
+
+  .mixer {
+    background: var(--panel); border: 1px solid var(--edge);
+    border-radius: 12px; padding: 10px; display: flex; flex-direction: column; gap: 4px;
+  }
+  .mixer label { font-size: 10px; color: var(--dim); text-align: center; letter-spacing: 1px; }
+  #xf { accent-color: #e8e2d5; height: 34px; }
+</style>
+</head>
+<body>
+<header>
+  <h1>ESP-DJ3000</h1>
+  <div id="conn">connecting…</div>
+</header>
+
+<div class="decks">
+  <section class="deck" data-side="1" style="color:var(--cyan)"></section>
+  <section class="deck" data-side="2" style="color:var(--amber)"></section>
+</div>
+
+<div class="mixer">
+  <label>CROSSFADER</label>
+  <input id="xf" type="range" min="0" max="1000" value="500">
+</div>
+
+<script>
+"use strict";
+
+/* ---- WebSocket with auto-reconnect ---- */
+let ws = null;
+const connEl = document.getElementById("conn");
+function connect() {
+  ws = new WebSocket(`ws://${location.host}/ws`);
+  ws.onopen = () => { connEl.textContent = "live"; connEl.classList.add("ok"); };
+  ws.onclose = () => {
+    connEl.textContent = "reconnecting…"; connEl.classList.remove("ok");
+    setTimeout(connect, 1000);
+  };
+  ws.onmessage = (ev) => {
+    try { onState(JSON.parse(ev.data)); } catch (_) {}
+  };
+}
+connect();
+
+function send(obj) {
+  if (ws && ws.readyState === WebSocket.OPEN) ws.send(JSON.stringify(obj));
+}
+
+/* 30 Hz throttle for continuous controls: latest value wins. */
+const pending = new Map();
+setInterval(() => {
+  for (const [, msg] of pending) send(msg);
+  pending.clear();
+}, 33);
+function sendThrottled(key, msg) { pending.set(key, msg); }
+
+/* ---- deck panels ---- */
+const LOOPS = [1, 2, 4, 8];
+function buildDeck(el) {
+  const side = +el.dataset.side;
+  el.innerHTML = `
+    <div class="title">— no track —</div>
+    <div class="bpm">---.-<small> BPM</small></div>
+    <div class="beatbar"><i></i></div>
+    <div class="row">
+      <button data-op="cue">CUE</button>
+      <button data-op="play">PLAY</button>
+      <button data-op="sync">SYNC</button>
+    </div>
+    <div class="pads">
+      ${[0,1,2,3].map(i => `<button data-hotcue="${i}">${i+1}</button>`).join("")}
+    </div>
+    <div class="row">
+      <button data-jump="-4">−4</button>
+      <button data-loop="4">LOOP 4</button>
+      <button data-op="slip">SLIP</button>
+      <button data-jump="4">+4</button>
+    </div>
+    <div class="fader">
+      <label>TEMPO ±8%</label>
+      <input type="range" class="tempo" min="-1000" max="1000" value="0">
+    </div>
+    <div class="fader">
+      <label>FILTER</label>
+      <input type="range" class="filter" min="-1000" max="1000" value="0">
+    </div>`;
+
+  el.querySelectorAll("[data-op]").forEach(b => {
+    const op = b.dataset.op;
+    if (op === "cue") {
+      // CDJ cue is press/release, not a click
+      b.addEventListener("pointerdown", () => send({t:"op", side, op:"cue"}));
+      b.addEventListener("pointerup", () => send({t:"op", side, op:"cue_up"}));
+      b.addEventListener("pointerleave", () => send({t:"op", side, op:"cue_up"}));
+    } else {
+      b.addEventListener("click", () => send({t:"op", side, op}));
+    }
+  });
+  el.querySelectorAll("[data-hotcue]").forEach(b =>
+    b.addEventListener("click", () =>
+      send({t:"op", side, op:"hotcue", arg:+b.dataset.hotcue})));
+  el.querySelectorAll("[data-jump]").forEach(b =>
+    b.addEventListener("click", () =>
+      send({t:"op", side, op:"jump", arg:+b.dataset.jump})));
+  const loopBtn = el.querySelector("[data-loop]");
+  let loopIdx = 2;
+  loopBtn.addEventListener("click", () =>
+    send({t:"op", side, op:"loop", arg:LOOPS[loopIdx]}));
+  loopBtn.addEventListener("dblclick", () => {
+    loopIdx = (loopIdx + 1) % LOOPS.length;
+    loopBtn.textContent = `LOOP ${LOOPS[loopIdx]}`;
+  });
+  el.querySelector(".tempo").addEventListener("input", (e) =>
+    sendThrottled(`tempo${side}`,
+      {t:"tempo", side, v: (+e.target.value / 1000) * 0.08}));
+  el.querySelector(".filter").addEventListener("input", (e) =>
+    sendThrottled(`filter${side}`,
+      {t:"filter", side, v: +e.target.value / 1000}));
+  return el;
+}
+const deckEls = {};
+document.querySelectorAll(".deck").forEach(el => {
+  buildDeck(el);
+  deckEls[+el.dataset.side] = el;
+});
+
+document.getElementById("xf").addEventListener("input", (e) =>
+  sendThrottled("xf", {t:"xf", v: +e.target.value / 1000}));
+
+/* ---- state updates (10 Hz from the deck) ----
+ * The serving deck reports its own side; the partner's panel keeps its
+ * last state and dims if it goes stale. */
+const lastSeen = {1: 0, 2: 0};
+function onState(s) {
+  if (s.t !== "state") return;
+  const el = deckEls[s.side];
+  if (!el) return;
+  lastSeen[s.side] = Date.now();
+  el.querySelector(".title").textContent = s.loaded ? s.title : "— no track —";
+  el.querySelector(".bpm").innerHTML =
+    `${(+s.bpm).toFixed(1)}<small> BPM ${s.pitch >= 0 ? "+" : ""}${(s.pitch*100).toFixed(1)}%</small>`;
+  el.querySelector(".beatbar i").style.width = `${(1 - s.phase) * 100}%`;
+  el.querySelector('[data-op="play"]').classList.toggle("lit", !!s.playing);
+  el.querySelector('[data-op="sync"]').classList.toggle("lit", !!s.sync);
+  el.querySelector('[data-op="slip"]').classList.toggle("lit", !!s.slip);
+  el.querySelector("[data-loop]").classList.toggle("lit", !!s.loop);
+}
+setInterval(() => {
+  for (const side of [1, 2]) {
+    deckEls[side].style.opacity =
+      Date.now() - lastSeen[side] > 2000 ? 0.45 : 1;
+  }
+}, 500);
+</script>
+</body>
+</html>

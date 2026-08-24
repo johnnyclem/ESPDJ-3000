@@ -1,0 +1,8 @@
+# ESP-DJ3000 deck — 16MB flash.
+# littlefs holds the single-file phone web app (webapp/index.html).
+# Name,   Type, SubType, Offset,  Size,   Flags
+nvs,      data, nvs,     0x9000,  0x6000,
+phy_init, data, phy,     0xf000,  0x1000,
+factory,  app,  factory, 0x10000, 4M,
+ota_0,    app,  ota_0,   ,        4M,
+littlefs, data, spiffs,  ,        1M,
