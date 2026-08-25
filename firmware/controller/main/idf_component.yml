@@ -1,0 +1,3 @@
+dependencies:
+  idf: ">=5.2"
+  espressif/led_strip: "^2.5.0"  # RGB pad edge lighting

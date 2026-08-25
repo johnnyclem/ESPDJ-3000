@@ -1,0 +1,46 @@
+name: CI
+
+on:
+  push:
+    branches: ["**"]
+  pull_request:
+
+jobs:
+  host-tests:
+    name: Portable core (gcc host tests)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build and run
+        run: make -C tests/host test
+
+  prep-tests:
+    name: Prep CLI (pytest)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install
+        run: pip install numpy pytest
+      - name: Test
+        run: python -m pytest tools/prep/tests -q
+
+  webapp-syntax:
+    name: Web app (JS syntax)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+      - name: Check inline script parses
+        run: |
+          python3 - <<'EOF'
+          import re
+          html = open('webapp/index.html').read()
+          m = re.search(r'<script>(.*)</script>', html, re.S)
+          open('/tmp/app.js', 'w').write(m.group(1))
+          EOF
+          node --check /tmp/app.js

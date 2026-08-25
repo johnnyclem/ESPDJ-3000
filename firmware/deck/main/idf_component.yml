@@ -1,0 +1,9 @@
+## ESP-DJ3000 deck — managed component dependencies
+dependencies:
+  idf: ">=5.2"
+  lvgl/lvgl: "~9.1.0"
+  espressif/esp_lcd_gc9a01: "^2.0.0"     # 240x240 round IPS
+  espressif/esp_lcd_touch_cst816s: "^1.0.3"
+  espressif/led_strip: "^2.5.0"          # WS2812 beat ring (RMT backend)
+  espressif/mdns: "^1.2.0"               # dj.local
+  joltwallet/littlefs: "^1.14.0"         # web app storage

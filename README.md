@@ -158,3 +158,102 @@ Layout per the reference image: 2+2 encoders top, 4+4 edge-lit pads flanking, te
 | Interconnect + controller PCBs (JLC) | — | ~$15 |
 | **Total** | | **~$140 + printed enclosures** |
 
+
+---
+
+# Software implementation
+
+Everything below §0-§9 describes the design; this section describes the code
+that implements it.
+
+```
+common/                  Portable C99 core, shared by both firmwares and the
+                         host test suite: wire protocol + topology resolution
+                         (espdj_proto), cubic varispeed resampler
+                         (espdj_resampler), SPSC audio ring (espdj_ringbuf),
+                         EQ/filter/crossfader DSP (espdj_mix), Link-style
+                         beat-sync discipline (espdj_sync).
+firmware/deck/           ESP-IDF (>= 5.2) project for the MaTouch 1.28"
+                         ToolSet_Controller (ESP32-S3). Core 1: SD feeder +
+                         RT audio pipeline. Core 0: LVGL UI + jog ring,
+                         SENSE/bus discovery, ESP-NOW pairing, SoftAP +
+                         captive portal + dj.local + WebSocket, WS2812 beat
+                         ring, haptics.
+firmware/controller/     ESP-IDF project for the ESP32-C3 control surface:
+                         MCP23017 pads/encoders, RC+hysteresis ADC faders,
+                         bus master (250 Hz control frames, deck polling),
+                         pad edge lighting.
+tools/prep/              Desktop prep CLI (`espdj-prep`, Python): WAV ->
+                         track.json sidecars (BPM, beatgrid anchor, key,
+                         cues, ring-waveform overview), Rekordbox XML
+                         import, 8-channel stems pack/unpack.
+webapp/index.html        Single-file phone SPA served from the deck's
+                         LittleFS (WebSocket, 30 Hz throttle).
+tests/host/              gcc unit tests for everything in common/.
+```
+
+## Building & testing
+
+Host tests (no hardware needed):
+
+```sh
+make -C tests/host test           # protocol, DSP, sync discipline
+pip install numpy pytest
+python -m pytest tools/prep/tests # prep CLI
+```
+
+Deck firmware (ESP-IDF ≥ 5.2 installed and exported):
+
+```sh
+cd firmware/deck
+idf.py set-target esp32s3
+idf.py build flash monitor
+```
+
+Controller firmware:
+
+```sh
+cd firmware/controller
+idf.py set-target esp32c3
+idf.py build flash monitor
+```
+
+Web app → deck LittleFS partition:
+
+```sh
+pip install littlefs-python
+littlefs-python create webapp lfs.bin -v --fs-size=0x100000
+# flash lfs.bin at the littlefs partition offset shown by idf.py partition-table
+```
+
+Track prep:
+
+```sh
+cd tools/prep && pip install -e .
+espdj-prep analyze /Volumes/SDCARD            # sidecars for every WAV
+espdj-prep analyze --rekordbox rekordbox.xml /Volumes/SDCARD
+espdj-prep stems pack drums.wav bass.wav melody.wav vocals.wav -o track.8ch.wav
+```
+
+## Status vs. the build phases (§7)
+
+- **P0** — SD sequential-read bench ships in the deck firmware
+  (`sd_card_bench_kbps`, logged at boot with go/no-go verdicts for single
+  stream and stems). The analog-bus noise bench is hardware work.
+- **P1** — implemented: full RT audio path (feeder → PSRAM cache → cubic
+  resampler → EQ/filter → I2S), varispeed/scratch from the jog ring,
+  cue/hot-cue/loop/slip/beat-jump, haptics, LED beat ring, LVGL player +
+  browser, prep CLI.
+- **P2** — implemented: SENSE discovery + resistor ID, half-duplex 1-wire
+  bus with master polling, topology/role auto-assignment, crossfader as a
+  control signal, 10 Hz timestamped beat-phase sync (±0.02% trim), ESP-NOW
+  undocked pairing, phone web app.
+- **P3** — implemented: controller firmware (scan, bus master, pad LEDs).
+- **P4** — stems groundwork only (prep-side interleave + 8-ch WAV reader on
+  the deck); Link bridge, USB-MIDI, sampler, FX, key shift remain open.
+
+Pin maps in `firmware/*/main/pins.h` are provisional for the expansion
+wiring — verify against your board revision before first flash. The
+firmware compiles against ESP-IDF ≥ 5.2 with the managed components in
+`idf_component.yml`; only the portable core and prep CLI are covered by
+the CI test suite (no hardware in the loop).
